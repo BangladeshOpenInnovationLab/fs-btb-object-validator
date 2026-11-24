@@ -14,6 +14,55 @@
       height: 100%;
       margin: 0;
       padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    .layer-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+
+    .count-box {
+      background: rgba(255, 255, 255, 0.95);
+      padding: 10px 14px;
+      border-radius: 6px;
+      box-shadow: 0 1px 5px rgba(0, 0, 0, 0.25);
+      font-size: 13px;
+      line-height: 1.5;
+      color: #222;
+      min-width: 210px;
+    }
+
+    .count-box h4 {
+      margin: 0 0 6px 0;
+      font-size: 13px;
+      font-weight: 600;
+      border-bottom: 1px solid #e5e7eb;
+      padding-bottom: 4px;
+    }
+
+    .count-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .count-row.active {
+      font-weight: 600;
+    }
+
+    .count-total {
+      margin-top: 6px;
+      padding-top: 4px;
+      border-top: 1px solid #e5e7eb;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
     }
   </style>
 </head>
@@ -26,17 +75,13 @@
   ></script>
   <script>
     const DEFAULT_ZOOM = 21;
-
-    // Initialize map without a view yet so Leaflet doesn't fetch tiles at dummy coordinates
     const map = L.map('map');
 
-    const ITEM_BASE_URL =
-      'https://tiles.imagery.hotosm.org/raster/collections/openaerialmap/items/f310808a-78fc-4cd5-9e13-9efa64f15194';
-    const QUERY_PARAMS =
-      'assets=visual&bidx=1&bidx=2&bidx=3&rescale=65.0%2C171.0&rescale=69.0%2C169.0&rescale=62.0%2C164.0&nodata=65535.0';
+    const DEFAULT_TILE_URL =
+      'https://tiles.imagery.hotosm.org/raster/collections/openaerialmap/items/f310808a-78fc-4cd5-9e13-9efa64f15194/tiles/WebMercatorQuad/{z}/{x}/{y}?assets=visual&bidx=1&bidx=2&bidx=3&rescale=65.0%2C171.0&rescale=69.0%2C169.0&rescale=62.0%2C164.0&nodata=65535.0';
 
-    const TILE_URL = `${ITEM_BASE_URL}/tiles/WebMercatorQuad/{z}/{x}/{y}?${QUERY_PARAMS}`;
-    const TILEJSON_URL = `${ITEM_BASE_URL}/WebMercatorQuad/tilejson.json?${QUERY_PARAMS}`;
+    const TILEJSON_URL =
+      'https://tiles.imagery.hotosm.org/raster/collections/openaerialmap/items/f310808a-78fc-4cd5-9e13-9efa64f15194/WebMercatorQuad/tilejson.json?assets=visual&bidx=1&bidx=2&bidx=3&rescale=65.0%2C171.0&rescale=69.0%2C169.0&rescale=62.0%2C164.0&nodata=65535.0';
 
     const projects = [
       {
@@ -60,8 +105,8 @@
       return L.geoJSON(data, {
         style: {
           color: color,
-          weight: 2,
-          fillOpacity: 0.35
+          weight: 2.5,
+          fillOpacity: 0.3
         },
         pointToLayer: (feature, latlng) => {
           return L.circleMarker(latlng, {
@@ -75,33 +120,49 @@
         onEachFeature: (feature, layer) => {
           if (feature.properties) {
             const rows = Object.entries(feature.properties)
+              .filter(([k]) => k !== 'imagery_url')
               .map(([k, v]) => `<strong>${k}:</strong> ${v}`)
               .join('<br>');
-            layer.bindPopup(rows);
+            if (rows) {
+              layer.bindPopup(rows);
+            }
           }
         }
       });
     }
 
-    // Safely load a GeoJSON file even if it is currently empty or missing
     async function loadProject(project) {
       try {
         const res = await fetch(project.url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const text = await res.text();
         if (!text.trim()) {
-          console.warn(`${project.url} is empty.`);
-          return { label: project.label, layer: createGeoJsonLayer(null, project.color) };
+          return {
+            ...project,
+            count: 0,
+            imageryUrl: null,
+            layer: createGeoJsonLayer(null, project.color)
+          };
         }
         const data = JSON.parse(text);
-        return { label: project.label, layer: createGeoJsonLayer(data, project.color) };
+        const count = Array.isArray(data.features) ? data.features.length : 0;
+        return {
+          ...project,
+          count,
+          imageryUrl: data.imagery_url || null,
+          layer: createGeoJsonLayer(data, project.color)
+        };
       } catch (err) {
         console.warn(`Could not load ${project.url}:`, err.message);
-        return { label: project.label, layer: createGeoJsonLayer(null, project.color) };
+        return {
+          ...project,
+          count: 0,
+          imageryUrl: null,
+          layer: createGeoJsonLayer(null, project.color)
+        };
       }
     }
 
-    // Fetch imagery metadata (bounds + native zoom) so Leaflet never requests 404 out-of-bounds tiles
     async function loadImageryMetadata() {
       try {
         const res = await fetch(TILEJSON_URL);
@@ -114,12 +175,51 @@
         return {
           bounds,
           minZoom: tj.minzoom ?? 0,
-          maxNativeZoom: tj.maxzoom ?? 21
+          maxNativeZoom: tj.maxzoom ?? 22
         };
       } catch (err) {
         console.warn('Could not load TileJSON metadata:', err.message);
-        return { bounds: null, minZoom: 0, maxNativeZoom: 21 };
+        return { bounds: null, minZoom: 0, maxNativeZoom: 22 };
       }
+    }
+
+    function createCountControl(loadedProjects) {
+      const control = L.control({ position: 'bottomleft' });
+      let container;
+
+      control.onAdd = function () {
+        container = L.DomUtil.create('div', 'count-box');
+        L.DomEvent.disableClickPropagation(container);
+        control.update(loadedProjects[0].label);
+        return container;
+      };
+
+      control.update = function (activeLabel) {
+        if (!container) return;
+        const total = loadedProjects.reduce((sum, p) => sum + p.count, 0);
+        const rowsHtml = loadedProjects
+          .map((p) => {
+            const isActive = p.label === activeLabel;
+            return `
+              <div class="count-row ${isActive ? 'active' : ''}">
+                <span><span class="layer-dot" style="background:${p.color}"></span>${p.label}</span>
+                <span>${p.count}</span>
+              </div>
+            `;
+          })
+          .join('');
+
+        container.innerHTML = `
+          <h4>Detected Objects</h4>
+          ${rowsHtml}
+          <div class="count-total">
+            <span>Total Objects</span>
+            <span>${total}</span>
+          </div>
+        `;
+      };
+
+      return control;
     }
 
     async function initMap() {
@@ -128,25 +228,32 @@
         Promise.all(projects.map(loadProject))
       ]);
 
-      // 1. Add OpenAerialMap layer constrained to its actual capture bounds & native zoom
+      // Use imagery_url from GeoJSON if available, otherwise fall back to default URL
+      const activeTileUrl =
+        loadedProjects.find((p) => p.imageryUrl)?.imageryUrl || DEFAULT_TILE_URL;
+
       const tileOptions = {
         tms: false,
         minZoom: imageryMeta.minZoom,
         maxNativeZoom: imageryMeta.maxNativeZoom,
-        maxZoom: 22,
+        maxZoom: 23,
         attribution: 'Imagery &copy; OpenAerialMap / HOT'
       };
       if (imageryMeta.bounds) {
         tileOptions.bounds = imageryMeta.bounds;
       }
-      L.tileLayer(TILE_URL, tileOptions).addTo(map);
+      L.tileLayer(activeTileUrl, tileOptions).addTo(map);
 
-      // 2. Register GeoJSON switcher layers
+      // Build layer switcher with color dots and object counts
       const switcherLayers = {};
+      const htmlLabelToPlain = {};
       let firstValidBounds = null;
 
       loadedProjects.forEach((item, index) => {
-        switcherLayers[item.label] = item.layer;
+        const displayLabel = `<span class="layer-dot" style="background:${item.color}"></span>${item.label} (<strong>${item.count}</strong>)`;
+        switcherLayers[displayLabel] = item.layer;
+        htmlLabelToPlain[displayLabel] = item.label;
+
         const b = item.layer.getBounds();
         if (b.isValid() && !firstValidBounds) {
           firstValidBounds = b;
@@ -156,19 +263,24 @@
         }
       });
 
-      // 3. Center at zoom 21 on GeoJSON data first, falling back to imagery center
+      // Center at zoom 21 on GeoJSON features first, falling back to imagery bounds
       if (firstValidBounds) {
         map.setView(firstValidBounds.getCenter(), DEFAULT_ZOOM);
       } else if (imageryMeta.bounds) {
         map.setView(imageryMeta.bounds.getCenter(), DEFAULT_ZOOM);
       } else {
-        map.setView([0, 0], 2);
+        map.setView([23.7277, 90.3691], DEFAULT_ZOOM);
       }
 
-      // 4. Add expanded layer switcher in top-right corner
       L.control.layers(switcherLayers, null, { collapsed: false }).addTo(map);
 
+      const countControl = createCountControl(loadedProjects).addTo(map);
+
       map.on('baselayerchange', (e) => {
+        const plainLabel = htmlLabelToPlain[e.name];
+        if (plainLabel) {
+          countControl.update(plainLabel);
+        }
         if (e.layer.getBounds && e.layer.getBounds().isValid()) {
           map.panTo(e.layer.getBounds().getCenter());
         }

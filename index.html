@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Project GeoJSON Map</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    crossorigin=""
+  />
+  <style>
+    html, body, #map {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    crossorigin=""
+  ></script>
+  <script>
+    const DEFAULT_ZOOM = 21;
+
+    // Initialize map without a view yet so Leaflet doesn't fetch tiles at dummy coordinates
+    const map = L.map('map');
+
+    const ITEM_BASE_URL =
+      'https://tiles.imagery.hotosm.org/raster/collections/openaerialmap/items/f310808a-78fc-4cd5-9e13-9efa64f15194';
+    const QUERY_PARAMS =
+      'assets=visual&bidx=1&bidx=2&bidx=3&rescale=65.0%2C171.0&rescale=69.0%2C169.0&rescale=62.0%2C164.0&nodata=65535.0';
+
+    const TILE_URL = `${ITEM_BASE_URL}/tiles/WebMercatorQuad/{z}/{x}/{y}?${QUERY_PARAMS}`;
+    const TILEJSON_URL = `${ITEM_BASE_URL}/WebMercatorQuad/tilejson.json?${QUERY_PARAMS}`;
+
+    const projects = [
+      {
+        label: 'Water Tank',
+        url: './data/project1.geojson',
+        color: '#0077b6'
+      },
+      {
+        label: 'Discarded Tires',
+        url: './data/project2.geojson',
+        color: '#e63946'
+      },
+      {
+        label: 'Repurposed Tubs or Basins',
+        url: './data/project3.geojson',
+        color: '#2a9d8f'
+      }
+    ];
+
+    function createGeoJsonLayer(data, color) {
+      return L.geoJSON(data, {
+        style: {
+          color: color,
+          weight: 2,
+          fillOpacity: 0.35
+        },
+        pointToLayer: (feature, latlng) => {
+          return L.circleMarker(latlng, {
+            radius: 7,
+            fillColor: color,
+            color: '#ffffff',
+            weight: 1.5,
+            fillOpacity: 0.9
+          });
+        },
+        onEachFeature: (feature, layer) => {
+          if (feature.properties) {
+            const rows = Object.entries(feature.properties)
+              .map(([k, v]) => `<strong>${k}:</strong> ${v}`)
+              .join('<br>');
+            layer.bindPopup(rows);
+          }
+        }
+      });
+    }
+
+    // Safely load a GeoJSON file even if it is currently empty or missing
+    async function loadProject(project) {
+      try {
+        const res = await fetch(project.url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+        if (!text.trim()) {
+          console.warn(`${project.url} is empty.`);
+          return { label: project.label, layer: createGeoJsonLayer(null, project.color) };
+        }
+        const data = JSON.parse(text);
+        return { label: project.label, layer: createGeoJsonLayer(data, project.color) };
+      } catch (err) {
+        console.warn(`Could not load ${project.url}:`, err.message);
+        return { label: project.label, layer: createGeoJsonLayer(null, project.color) };
+      }
+    }
+
+    // Fetch imagery metadata (bounds + native zoom) so Leaflet never requests 404 out-of-bounds tiles
+    async function loadImageryMetadata() {
+      try {
+        const res = await fetch(TILEJSON_URL);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const tj = await res.json();
+        const bounds =
+          Array.isArray(tj.bounds) && tj.bounds.length === 4
+            ? L.latLngBounds([tj.bounds[1], tj.bounds[0]], [tj.bounds[3], tj.bounds[2]])
+            : null;
+        return {
+          bounds,
+          minZoom: tj.minzoom ?? 0,
+          maxNativeZoom: tj.maxzoom ?? 21
+        };
+      } catch (err) {
+        console.warn('Could not load TileJSON metadata:', err.message);
+        return { bounds: null, minZoom: 0, maxNativeZoom: 21 };
+      }
+    }
+
+    async function initMap() {
+      const [imageryMeta, loadedProjects] = await Promise.all([
+        loadImageryMetadata(),
+        Promise.all(projects.map(loadProject))
+      ]);
+
+      // 1. Add OpenAerialMap layer constrained to its actual capture bounds & native zoom
+      const tileOptions = {
+        tms: false,
+        minZoom: imageryMeta.minZoom,
+        maxNativeZoom: imageryMeta.maxNativeZoom,
+        maxZoom: 22,
+        attribution: 'Imagery &copy; OpenAerialMap / HOT'
+      };
+      if (imageryMeta.bounds) {
+        tileOptions.bounds = imageryMeta.bounds;
+      }
+      L.tileLayer(TILE_URL, tileOptions).addTo(map);
+
+      // 2. Register GeoJSON switcher layers
+      const switcherLayers = {};
+      let firstValidBounds = null;
+
+      loadedProjects.forEach((item, index) => {
+        switcherLayers[item.label] = item.layer;
+        const b = item.layer.getBounds();
+        if (b.isValid() && !firstValidBounds) {
+          firstValidBounds = b;
+        }
+        if (index === 0) {
+          item.layer.addTo(map);
+        }
+      });
+
+      // 3. Center at zoom 21 on GeoJSON data first, falling back to imagery center
+      if (firstValidBounds) {
+        map.setView(firstValidBounds.getCenter(), DEFAULT_ZOOM);
+      } else if (imageryMeta.bounds) {
+        map.setView(imageryMeta.bounds.getCenter(), DEFAULT_ZOOM);
+      } else {
+        map.setView([0, 0], 2);
+      }
+
+      // 4. Add expanded layer switcher in top-right corner
+      L.control.layers(switcherLayers, null, { collapsed: false }).addTo(map);
+
+      map.on('baselayerchange', (e) => {
+        if (e.layer.getBounds && e.layer.getBounds().isValid()) {
+          map.panTo(e.layer.getBounds().getCenter());
+        }
+      });
+    }
+
+    initMap();
+  </script>
+</body>
+</html>
